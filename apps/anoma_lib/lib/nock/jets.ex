@@ -6,7 +6,7 @@ defmodule Nock.Jets do
   import Noun
   import Bitwise
   alias Anoma.Crypto.Sign
-  alias Anoma.TransparentResource.{Delta, Action}
+  alias Anoma.TransparentResource.{Delta, Action, Resource}
 
   @spec calculate_mug_of_core(non_neg_integer(), non_neg_integer()) ::
           non_neg_integer()
@@ -68,9 +68,9 @@ defmodule Nock.Jets do
   """
   @spec calculate_mug_of_layer(non_neg_integer()) :: non_neg_integer()
   def calculate_mug_of_layer(layer) do
-    context_axis = Integer.pow(2, Nock.stdlib_layers() - layer + 1) - 1
+    context_axis = layer_offset(layer)
 
-    with {:ok, context} <- Noun.axis(context_axis, Nock.rm_core()) do
+    with {:ok, context} <- Noun.axis(context_axis, Nock.Lib.rm_core()) do
       mug(context)
     end
   end
@@ -92,8 +92,9 @@ defmodule Nock.Jets do
   For our standard library, so far only layer 4 is parameterized
   """
   def calculate_mug_of_param_core(index_in_core, core_index, parent_layer) do
-    with {:ok, val} <-
-           calculate_core_param(core_index, index_in_core, parent_layer) do
+    with {:ok, core} <-
+           calculate_core_param(core_index, index_in_core, parent_layer),
+         {:ok, val} <- Noun.axis(14, core) do
       Noun.mug(hd(val))
     end
   end
@@ -111,7 +112,9 @@ defmodule Nock.Jets do
   For our standard library, so far only layer 4 is parameterized
   """
   def calculate_mug_of_param_layer(core_index, parent_layer) do
-    with {:ok, core} <- calculate_core_param(core_index, 4, parent_layer),
+    with {:ok, layer} <-
+           parent_layer |> layer_offset |> Noun.axis(Nock.Lib.rm_core()),
+         {:ok, core} <- core_index |> Noun.axis(layer),
          {:ok, parent} <- Noun.axis(14, core) do
       Noun.mug(parent)
     end
@@ -123,36 +126,28 @@ defmodule Nock.Jets do
           non_neg_integer()
         ) ::
           :error | {:ok, Noun.t()}
-  def calculate_core_param(core_index, gate_index, parent_layer) do
-    Nock.nock(Nock.logics_core(), [
-      7,
-      [
-        9,
-        core_index,
-        0 | Noun.index_to_offset(Nock.stdlib_layers() - parent_layer + 2)
-      ],
-      9,
-      gate_index,
-      0 | 1
-    ])
+  def calculate_core_param(core_index, index_in_core, parent_layer) do
+    with {:ok, layer} <-
+           parent_layer |> layer_offset |> Noun.axis(Nock.Lib.rm_core()),
+         {:ok, core} <- core_index |> Noun.axis(layer),
+         {:ok, res} <- Nock.nock(layer, core) do
+      index_in_core |> Noun.axis(res)
+    end
   end
 
   @spec calculate_core(non_neg_integer(), non_neg_integer()) ::
           :error | {:ok, Noun.t()}
-  defp calculate_core(index_in_core, parent_layer) do
-    Nock.nock(Nock.logics_core(), [
-      8,
-      # We drive `layers - parent + 2`, from how layers get pushed.
-      # Each layer pushes the previous one down by one. the + 2 is for:
-      # 0. layer 0 (I believe, Ι may be incorrect on this)
-      # 1. the logics_core
-      [
-        9,
-        index_in_core,
-        0 | Noun.index_to_offset(Nock.stdlib_layers() - parent_layer + 2)
-      ],
-      0 | 2
-    ])
+  def calculate_core(index_in_core, layer) do
+    with {:ok, res1} <-
+           layer |> layer_offset() |> Noun.axis(Nock.Lib.rm_core()),
+         {:ok, res2} <- index_in_core |> Noun.axis(res1) do
+      Nock.nock(res1, res2)
+    end
+  end
+
+  @spec layer_offset(non_neg_integer) :: non_neg_integer
+  defp layer_offset(layers) do
+    Noun.index_to_offset(Nock.Lib.stdlib_layers() - layers + 1)
   end
 
   # when this is called, we've already jet-matched axis 7.
@@ -483,7 +478,7 @@ defmodule Nock.Jets do
   def shax(core) do
     with {:ok, noun} when is_noun_atom(noun) <- sample(core),
          sample <- Noun.atom_integer_to_binary(noun) do
-      {:ok, :crypto.hash(:sha256, sample) |> an_integer()}
+      {:ok, :crypto.hash(:sha256, sample)}
     else
       _ -> :error
     end
@@ -602,6 +597,18 @@ defmodule Nock.Jets do
   end
 
   defp a_signed_integer(x), do: Noun.atom_binary_to_signed_integer(x)
+
+  @spec kind(Noun.t()) :: :error | {:ok, Noun.t()}
+  def kind(core) do
+    with {:ok, a} when is_noun_cell(a) <- sample(core),
+         {:ok, resource} <- Resource.from_noun(a) do
+      res = Resource.kind(resource)
+      {:ok, res}
+    else
+      _ ->
+        :error
+    end
+  end
 
   @spec delta_add(Noun.t()) :: :error | {:ok, Noun.t()}
   def delta_add(core) do
