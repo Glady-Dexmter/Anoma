@@ -29,10 +29,10 @@ defmodule AnomaNode.MixProject do
         :debugger,
         :enacl,
         :logger,
-        :mnesia,
         :runtime_tools,
         :tools
-      ]
+      ],
+      included_applications: [:mnesia]
     ]
   end
 

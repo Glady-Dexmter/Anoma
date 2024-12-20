@@ -22,7 +22,7 @@ defmodule AnomaLib.MixProject do
 
   def application do
     [
-      extra_applications: [:mnesia]
+      included_applications: [:mnesia]
     ]
   end
 

@@ -25,10 +25,11 @@ defmodule Anoma.Node.Logging do
   - `log_event/3`
   """
 
-  alias __MODULE__
   alias Anoma.Node
-  alias Node.{Registry, Transaction}
-  alias Transaction.{Mempool, Storage}
+  alias Anoma.Node.Logging
+  alias Anoma.Node.Registry
+  alias Anoma.Node.Tables
+  alias Anoma.Node.Transaction.Mempool
 
   use EventBroker.DefFilter
   use GenServer
@@ -36,6 +37,10 @@ defmodule Anoma.Node.Logging do
 
   require Node.Event
   require Logger
+
+  ############################################################
+  #                         Tables                           #
+  ############################################################
 
   ############################################################
   #                         State                            #
@@ -79,13 +84,9 @@ defmodule Anoma.Node.Logging do
 
     - `:node_id` - The ID of the Node to which a Logging Engine
                    instantiation is bound.
-    - `:table` - The name of the table to which all replay events are
-                 written.
-                 Default: __MODULE__.Events
     """
 
     field(:node_id, String.t())
-    field(:table, atom(), default: __MODULE__.Events)
   end
 
   deffilter LoggingFilter do
@@ -120,7 +121,7 @@ defmodule Anoma.Node.Logging do
 
   @spec start_link(list(startup_options())) :: term()
   def start_link(args) do
-    args = Keyword.validate!(args, [:node_id, :table, :rocks])
+    args = Keyword.validate!(args, [:node_id])
     name = Registry.via(args[:node_id], __MODULE__)
     GenServer.start_link(__MODULE__, args, name: name)
   end
@@ -140,17 +141,10 @@ defmodule Anoma.Node.Logging do
   def init(args) do
     Process.set_label(__MODULE__)
 
-    args =
-      Keyword.validate!(args, [
-        :node_id,
-        rocks: false,
-        table: __MODULE__.Events
-      ])
+    args = Keyword.validate!(args, [:node_id])
 
-    table =
-      String.to_atom("#{args[:table]}_#{:erlang.phash2(args[:node_id])}")
-
-    init_table(table, args[:rocks])
+    # initialize the necessary tables for the logging engine
+    init_table(args[:node_id])
 
     node_id = args[:node_id]
 
@@ -159,7 +153,7 @@ defmodule Anoma.Node.Logging do
       logging_filter()
     ])
 
-    {:ok, %__MODULE__{node_id: node_id, table: table}}
+    {:ok, %__MODULE__{node_id: node_id}}
   end
 
   ############################################################
@@ -259,7 +253,8 @@ defmodule Anoma.Node.Logging do
          state
        ) do
     :mnesia.transaction(fn ->
-      :mnesia.write({state.table, id, {backend, code}})
+      table = Tables.table_events(state.node_id)
+      :mnesia.write({table, id, {backend, code}})
     end)
 
     log_fun({:info, "Transaction Launched. Id: #{inspect(id)}"})
@@ -278,8 +273,9 @@ defmodule Anoma.Node.Logging do
          state
        ) do
     :mnesia.transaction(fn ->
-      pending = match(:consensus, state.table)
-      :mnesia.write({state.table, :consensus, pending ++ [list]})
+      table = Tables.table_events(state.node_id)
+      pending = match(:consensus, table)
+      :mnesia.write({table, :consensus, pending ++ [list]})
     end)
 
     log_fun({:info, "Consensus provided order. List: #{inspect(list)}"})
@@ -298,14 +294,16 @@ defmodule Anoma.Node.Logging do
          },
          state
        ) do
+    table = Tables.table_events(state.node_id)
+
     :mnesia.transaction(fn ->
       for id <- id_list do
-        :mnesia.delete({state.table, id})
+        :mnesia.delete({table, id})
       end
 
-      current_pending = match(:consensus, state.table)
-      :mnesia.write({state.table, :consensus, tl(current_pending)})
-      :mnesia.write({state.table, :round, round})
+      current_pending = match(:consensus, table)
+      :mnesia.write({table, :consensus, tl(current_pending)})
+      :mnesia.write({table, :round, round})
     end)
 
     log_fun({:info, "Block succesfully committed. Round: #{inspect(round)}"})
@@ -315,6 +313,50 @@ defmodule Anoma.Node.Logging do
   ############################################################
   #                        Replay                            #
   ############################################################
+
+  @doc """
+  Given a node id, I try to do a replay of the previous state.
+  If this replay succeedd, I return ok, and the arguments to start up the node.
+  If I fail, I return an error tuple.
+  """
+  # @spec try_replay(String.t()) :: DynamicSupervisor.on_start_child()
+  def try_replay(node_id) do
+    # if evnets or updates table have data, there was previous data
+    # if the transaction supervisor starts:
+    # - is there previous data?
+    # - test data validity
+    # - restore data
+    # - start supervision tree
+    event_table = Tables.table_events(node_id)
+    block_table = Tables.table_blocks(node_id)
+    values_table = Tables.table_values(node_id)
+    updates_table = Tables.table_updates(node_id)
+
+    setup = replay_setup(event_table, block_table)
+
+    mock_id = Node.prefix_random_id("mock")
+
+    replay_table_clone(values_table, updates_table, mock_id)
+
+    replay_args = replay_args(setup)
+
+    res = try_launch(mock_id, replay_args)
+
+    case res do
+      :ok ->
+        {:ok, :replay_succeeded, replay_args}
+
+      :error ->
+        replay_args =
+          replay_args
+          |> Keyword.update!(
+            :mempool,
+            &Keyword.drop(&1, [:transactions, :consensus])
+          )
+
+        {:error, :replay_failed, replay_args}
+    end
+  end
 
   @doc """
   I am the function to be played on restarts of the Anoma node with known ID.
@@ -329,14 +371,26 @@ defmodule Anoma.Node.Logging do
 
   @spec restart_with_replay(String.t()) :: DynamicSupervisor.on_start_child()
   def restart_with_replay(node_id) do
-    event_table = Logging.table_name(node_id)
-    block_table = Storage.blocks_table(node_id)
-    values_table = Storage.values_table(node_id)
-    updates_table = Storage.updates_table(node_id)
+    # if evnets or updates table have data, there was previous data
+    # if the transaction supervisor starts:
+    # - is there previous data?
+    # - test data validity
+    # - restore data
+    # - start supervision tree
+    event_table = Tables.table_events(node_id)
+    block_table = Tables.table_blocks(node_id)
 
+    values_table = Tables.table_values(node_id)
+    updates_table = Tables.table_updates(node_id)
+
+    # replay_Data
     setup = replay_setup(event_table, block_table)
     mock_id = Node.prefix_random_id("mock")
+
+    # copy tables
     replay_table_clone(values_table, updates_table, mock_id)
+
+    #
     replay_args = replay_args(setup)
 
     res =
@@ -344,7 +398,11 @@ defmodule Anoma.Node.Logging do
 
     case res do
       :ok ->
-        Anoma.Supervisor.start_node(node_id: node_id, tx_args: replay_args)
+        Anoma.Supervisor.start_node(
+          node_id: node_id,
+          tx_args: replay_args,
+          try_replay: false
+        )
 
       :error ->
         base_args =
@@ -375,7 +433,11 @@ defmodule Anoma.Node.Logging do
       EventBroker.subscribe_me([])
 
       {:ok, _pid} =
-        Anoma.Supervisor.start_node(node_id: mock_id, tx_args: replay_args)
+        Anoma.Supervisor.start_node(
+          node_id: mock_id,
+          tx_args: replay_args,
+          try_replay: false
+        )
 
       final_consensus = List.last(replay_args[:mempool][:consensus])
 
@@ -456,52 +518,25 @@ defmodule Anoma.Node.Logging do
   @doc """
   I am the function making a table copy for replay.
 
-  Given original updates and values table used by the Storage, I copy their
+  Given original updates and values ta   ble used by the Storage, I copy their
   data to separate tables for a new node. Used for trying a replay on a
   mock node.
   """
   @spec replay_table_clone(atom(), atom(), String.t()) :: any()
   def replay_table_clone(values_table, updates_table, node_id) do
-    :mnesia.transaction(fn ->
-      values = :mnesia.match_object({values_table, :_, :_})
-      updates = :mnesia.match_object({updates_table, :_, :_})
+    source_table = values_table
+    target_table = Tables.table_values(node_id)
+    {:ok, :table_copied} = Tables.duplicate_table(source_table, target_table)
 
-      new_values_table =
-        Storage.values_table(node_id)
-
-      new_updates_table =
-        Storage.updates_table(node_id)
-
-      for {var, name} <- [
-            {values, new_values_table},
-            {updates, new_updates_table}
-          ] do
-        :mnesia.create_table(name, attributes: [:key, :value])
-
-        for {_, key, value} <- var do
-          :mnesia.write({name, key, value})
-        end
-      end
-    end)
+    source_table = updates_table
+    target_table = Tables.table_updates(node_id)
+    {:ok, :table_copied} = Tables.duplicate_table(source_table, target_table)
+    :ok
   end
 
   ############################################################
   #                           Helpers                        #
   ############################################################
-
-  @spec init_table(atom(), bool()) :: {:atomic, :ok}
-  defp init_table(table, rocks) do
-    :mnesia.delete_table(table)
-    rocks_opt = Anoma.Utility.rock_opts(rocks)
-
-    :mnesia.create_table(table, rocks_opt ++ [attributes: [:type, :body]])
-
-    :mnesia.clear_table(table)
-
-    :mnesia.transaction(fn ->
-      :mnesia.write({table, :round, -1})
-    end)
-  end
 
   defp log_fun({:debug, msg}), do: Logger.debug(msg)
 
@@ -589,14 +624,21 @@ defmodule Anoma.Node.Logging do
     end
   end
 
-  @doc """
-  I am the name of the event table.
+  @spec init_table(String.t()) :: :ok
+  defp init_table(node_id) do
+    # initialize the tables
+    Tables.initialize_tables_for_node(node_id)
 
-  Given a Node ID, I create an appropriately named Event table for it.
-  """
+    # clear the table if it was not empty
+    Tables.clear_table(Tables.table_events(node_id))
 
-  @spec table_name(String.t()) :: atom()
-  def table_name(node_id) do
-    String.to_atom("#{Logging.Events}_#{:erlang.phash2(node_id)}")
+    # insert default record in the events table
+    table = Tables.table_events(node_id)
+
+    :mnesia.transaction(fn ->
+      :mnesia.write({table, :round, -1})
+    end)
+
+    :ok
   end
 end

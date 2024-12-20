@@ -17,7 +17,7 @@ defmodule Anoma.MixProject do
         plt_local_path: "plts/anoma.plt",
         plt_core_path: "plts/core.plt",
         flags: ["-Wno_improper_lists"],
-        plt_add_apps: [:mix, :ex_unit]
+        plt_add_apps: [:mix, :ex_unit, :mnesia]
       ],
       # Docs
       name: "Anoma",
@@ -132,7 +132,8 @@ defmodule Anoma.MixProject do
       extra_applications: [
         :observer,
         :wx
-      ]
+      ],
+      included_applications: [:mnesia]
     ]
   end
 

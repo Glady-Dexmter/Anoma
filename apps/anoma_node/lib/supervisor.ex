@@ -20,6 +20,8 @@ defmodule Anoma.Supervisor do
   def init(_args) do
     Process.set_label(__MODULE__)
 
+    :ok = Anoma.Node.Tables.initialize_storage()
+
     children = [
       {Elixir.Registry, keys: :unique, name: Anoma.Node.Registry},
       {DynamicSupervisor, name: Anoma.Node.NodeSupervisor}
@@ -43,7 +45,8 @@ defmodule Anoma.Supervisor do
       Keyword.validate!(args, [
         :node_id,
         :grpc_port,
-        tx_args: [mempool: [], ordering: [], storage: []]
+        tx_args: [mempool: [], ordering: [], storage: []],
+        try_replay: true
       ])
 
     DynamicSupervisor.start_child(

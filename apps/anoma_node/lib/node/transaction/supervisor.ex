@@ -8,7 +8,7 @@ defmodule Anoma.Node.Transaction.Supervisor do
   @spec start_link(list({:node_id, String.t()} | {:tx_args, any()})) ::
           GenServer.on_start()
   def start_link(args) do
-    args = Keyword.validate!(args, [:node_id, :tx_args])
+    args = Keyword.validate!(args, [:node_id, :tx_args, :replay])
     Supervisor.start_link(__MODULE__, args)
   end
 
